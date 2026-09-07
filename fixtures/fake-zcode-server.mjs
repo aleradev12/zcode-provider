@@ -1,0 +1,80 @@
+// Test fixture — NOT an official or complete ZCode app-server implementation.
+//
+// This hand-written fake models only the NDJSON messages used by this test. Its
+// event ordering is based on behavior observed from the app-server bundled with
+// ZCode Desktop 0.16.5: on a subsequent turn, a state.updated notification with
+// reason prompt_completed can arrive after turn.started but before the new
+// model output and turn.completed event. Keep this fixture version-scoped and
+// revalidate it against the real app-server when ZCode's protocol changes.
+import { createInterface } from "node:readline";
+
+const input = createInterface({ input: process.stdin });
+let turn = 0;
+
+function send(message) {
+  process.stdout.write(`${JSON.stringify(message)}\n`);
+}
+
+function event(type, payload = {}) {
+  send({ method: "session/event", params: { sessionId: "fixture-session", type, payload } });
+}
+
+input.on("line", (line) => {
+  const request = JSON.parse(line);
+  const { id, method } = request;
+
+  if (method === "session/create") {
+    send({ id, result: { session: { sessionId: "fixture-session" } } });
+    return;
+  }
+  if (method === "session/setModel" || method === "session/subscribe") {
+    send({ id, result: {} });
+    return;
+  }
+  if (method === "session/send") {
+    turn += 1;
+    const answer = `FIXTURE-TURN-${turn}-OK`;
+    send({ id, result: {} });
+
+    // Reproduce the observed second-turn race: prompt_completed from prior
+    // state arrives after the next turn starts but before its model output and
+    // authoritative terminal event. A broken bridge returns an empty response.
+    event("turn.started");
+    if (turn > 1) {
+      send({
+        method: "state.updated",
+        params: {
+          scope: "session",
+          sessionId: "fixture-session",
+          reason: "prompt_completed",
+          patch: { status: "idle" },
+        },
+      });
+    }
+
+    setTimeout(() => {
+      event("model.streaming", {
+        kind: "text_delta",
+        assistantMessageId: `assistant-${turn}`,
+        delta: answer,
+      });
+      event("model.streaming", {
+        kind: "text_end",
+        assistantMessageId: `assistant-${turn}`,
+      });
+      event("turn.completed", { response: answer });
+    }, 500);
+    return;
+  }
+  if (method === "session/messages") {
+    send({ id, result: { messages: [] } });
+    return;
+  }
+  if (method === "session/stop") {
+    send({ id, result: {} });
+    event("turn.failed", { error: { message: "stopped" } });
+    return;
+  }
+
+  send({ id, result: {} });
+});
