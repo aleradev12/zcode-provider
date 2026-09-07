@@ -41,9 +41,11 @@ ZCode's app-server resolves models only from its settings file
 (`~/.zcode/cli/config.json`), while the ZCode UI writes providers to
 `~/.zcode/v2/config.json`. This extension:
 
-1. **Merges enabled providers** from the v2 config into the settings file at
-   server spawn and whenever either `config.json` changes (the app-server
-   re-reads its settings file live, so newly merged providers work immediately).
+1. **Merges explicitly enabled providers** from the v2 config into the settings
+   file at server spawn and whenever either configured file changes. Inactive
+   Desktop provider variants previously copied verbatim are removed from the CLI
+   config, preventing stale empty API keys from invalidating the app-server's
+   strict settings schema while preserving distinct CLI-only configurations.
 2. **Bootstraps the settings file's `model` field.** The app-server validates
    the settings file against a strict schema that *requires* a top-level
    `model` — a `"provider/model"` ref — and refuses to run a turn with
@@ -52,8 +54,9 @@ ZCode's app-server resolves models only from its settings file
    back to this field), else falls back to the v2 config's own model
    selection, else the first enabled provider's first model. The settings file
    is also created from scratch when it does not exist yet.
-3. **Publishes the catalog to pi** via `refreshModels`, so opening `/model`
-   always shows the current providers/models without a reload.
+3. **Publishes the catalog to pi** via `refreshModels`, including configured
+   context-window and output-token limits, so opening `/model` always shows the
+   current providers/models without a reload.
 4. **Switches the ZCode session model** with `session/setModel` when you pick a
    different pi model. The choice also persists back to ZCode's config
    (`model.main`), so the model you last used in pi is ZCode's default.
@@ -73,6 +76,20 @@ Environment variables (set before starting pi):
 | `ZCODE_AUTO_ALLOW` | `1` (enabled) | Auto-answer ZCode permission prompts. Set to `0` to deny tool permission requests |
 | `ZCODE_TURN_TIMEOUT_MS` | `1800000` (30 min) | Per-turn budget. On timeout the bridge interrupts the turn (`session/stop`) and sends the session `go on`, so long tasks keep progressing instead of failing. Raise it for turns that need to run longer uninterrupted |
 | `ZCODE_STEER_MODE` | auto | How a message typed in pi while a ZCode turn is running is handled, using ZCode's own two delivery modes: `queue` (processed as a new turn after the current one completes — pi's standard behavior) or `guide` (sent to the running session via ZCode's v4 command channel and injected at the next tool/message boundary inside the same turn, falling back to a queue when the turn is not steerable). Default follows ZCode's own UI setting (`zcodeInteractionBehavior` in `~/.zcode/v2/setting.json`): `guide` when ZCode is configured for guide-mode interaction, else `queue`. Set explicitly to override |
+
+## Testing
+
+Deterministic regression tests use a hand-written fake app-server to reproduce
+the `prompt_completed` race across three consecutive turns:
+
+```sh
+npm test
+```
+
+The fake is **not an official or complete ZCode protocol implementation**. It
+models only the NDJSON messages needed by this regression test, based on event
+ordering observed from the app-server bundled with ZCode Desktop 0.16.5. It
+should be revalidated against the real app-server when ZCode's protocol changes.
 
 ## Security
 
@@ -98,9 +115,11 @@ JSON-RPC). The bridge implements the subset:
 `session/create` → answer `session/requestRuntimePreferences` → `session/resume`
 (no-op while resident, rehydrates after idle eviction) → `session/subscribe` →
 `session/send` → stream `session/event` notifications: `model.streaming`
-(text/reasoning/tool-input deltas), `tool.updated`, `turn.completed` — done on
-`state.updated` (reason `prompt_completed`). Model switching uses
-`session/setModel`.
+(text/reasoning/tool-input deltas), `tool.updated`, `turn.completed` and
+`turn.failed`. The authoritative `turn.completed` / `turn.failed` events end a
+turn; the app-server bundled with ZCode Desktop 0.16.5 may emit a racy
+`state.updated` `prompt_completed` snapshot, which is not treated as terminal.
+Model switching uses `session/setModel`.
 
 The ZCode app-server evicts idle sessions from memory (resident pool: 10 min
 idle timeout, LRU beyond 16 sessions) and would otherwise reject stale session

@@ -33,9 +33,12 @@
 // session/requestRuntimePreferences (runtime-materialization and
 // user-execution scopes) -> session/subscribe (turns on live session/event
 // notifications) -> session/send {sessionId, content, runtimeModel} -> stream
-// model.streaming / tool.updated / turn.* events -> done on state.updated
-// reason "prompt_completed". Without the subscription the turn still
-// completes and the final text is harvested from session/messages.
+// model.streaming / tool.updated / turn.* events -> finish only on the
+// authoritative session/event turn.completed or turn.failed notification.
+// The app-server bundled with ZCode Desktop 0.16.5 can emit a state.updated
+// prompt_completed snapshot that races with the next turn, so it is not
+// terminal. A live subscription is
+// required so those authoritative terminal events cannot be missed.
 //
 // Messages typed in pi while a turn is running follow ZCode's own
 // followupMode semantics (see ZCODE_STEER_MODE): queue (default) processes
@@ -71,7 +74,7 @@ import { randomUUID } from "node:crypto";
 import { copyFileSync, existsSync, readFileSync, watch, writeFileSync } from "node:fs";
 import { appendFile } from "node:fs/promises";
 import { createInterface } from "node:readline";
-import { dirname } from "node:path";
+import { basename, dirname } from "node:path";
 
 const SETTINGS_PATH =
   process.env.ZCODE_SETTINGS ?? `${process.env.HOME ?? "~"}/.zcode/cli/config.json`;
@@ -116,6 +119,8 @@ interface CatalogModel {
   id: string; // `${providerName}/${modelId}`, the pi model id
   providerId: string;
   modelId: string;
+  contextWindow?: number; // settings file models[id].limit.context
+  maxTokens?: number; // settings file models[id].limit.output
 }
 
 // The app-server resolves models only from its settings file provider map; the
@@ -124,13 +129,18 @@ interface CatalogModel {
 function readCatalog(): CatalogModel[] {
   try {
     const cfg = JSON.parse(readFileSync(SETTINGS_PATH, "utf8")) as {
-      provider?: Record<string, { name?: string; models?: Record<string, unknown> }>;
+      provider?: Record<string, {
+        name?: string;
+        models?: Record<string, { limit?: { context?: number; output?: number } }>;
+      }>;
     };
     return Object.entries(cfg.provider ?? {}).flatMap(([providerId, p]) =>
-      Object.keys(p.models ?? {}).map((modelId) => ({
+      Object.entries(p.models ?? {}).map(([modelId, m]) => ({
         id: `${p.name ?? providerId}/${modelId}`,
         providerId,
         modelId,
+        contextWindow: m.limit?.context,
+        maxTokens: m.limit?.output,
       })),
     );
   } catch {
@@ -290,9 +300,24 @@ function mergeV2Providers(): string[] {
     };
     const changed: string[] = [];
     for (const [pid, p] of Object.entries(v2.provider ?? {})) {
-      // Skip disabled entries: the app-server catalog rejects them at load
-      // ("Model config is missing"), and the user did not enable them anyway.
-      if ((p as { enabled?: boolean }).enabled === false) continue;
+      // The Desktop v2 config also contains inactive provider variants with
+      // `enabled` omitted (for example the API-key variant while OAuth/Coding
+      // Plan is selected). Some of those carry apiKey: "", which makes the
+      // app-server reject the entire CLI config. The v2 registry is
+      // authoritative for provider ids it knows: copy explicitly enabled
+      // entries and remove inactive variants left by older bridge versions.
+      if ((p as { enabled?: boolean }).enabled !== true) {
+        // Remove only an exact stale copy made by an older bridge. Preserve a
+        // deliberately different CLI-only configuration with the same id.
+        if (
+          cli.provider?.[pid] &&
+          JSON.stringify(cli.provider[pid]) === JSON.stringify(p)
+        ) {
+          delete cli.provider[pid];
+          changed.push(pid);
+        }
+        continue;
+      }
       if (JSON.stringify(cli.provider?.[pid]) !== JSON.stringify(p)) {
         cli.provider ??= {};
         cli.provider[pid] = p;
@@ -340,11 +365,15 @@ function watchConfigs(): void {
     clearTimeout(timer);
     timer = setTimeout(() => mergeV2Providers(), 300);
   };
-  for (const dir of [dirname(SETTINGS_PATH), dirname(V2_CONFIG_PATH)]) {
+  for (const file of [SETTINGS_PATH, V2_CONFIG_PATH]) {
+    const dir = dirname(file);
+    const target = basename(file);
     try {
-      watch(dir, (_event, filename) => {
-        if (filename === "config.json") onChange();
+      const watcher = watch(dir, (_event, filename) => {
+        if (filename && String(filename) === target) onChange();
       });
+      // Headless pi runs must be allowed to exit after the turn completes.
+      watcher.unref();
     } catch {
       /* dir may not exist yet; the spawn-time merge covers that case */
     }
@@ -555,6 +584,7 @@ function startServer(): void {
     if (proc !== child) return;
     proc = null;
     sessionId = null;
+    guideSessions.clear();
     for (const [, p] of pending) p.reject(err);
     pending.clear();
   };
@@ -1095,9 +1125,8 @@ async function askOneQuestionInPi(
   );
 }
 
-// The app-server does not emit the final text until prompt_completed, but
-// session/messages right after completion is always queryable; used as the
-// non-streaming fallback when live subscription failed.
+// session/messages is queryable immediately after turn completion; use it as
+// the non-streaming fallback when live subscription failed.
 async function harvestLastAssistantText(): Promise<string> {
   if (!sessionId) return "";
   try {
@@ -1287,6 +1316,7 @@ function streamSimple(
     let turnError: string | undefined;
     let settled = false;
     let turnSettled = false;
+    let turnStarted = false;
     let failed = false;
 
     const blockAt = (idx: number) => output.content[idx];
@@ -1379,8 +1409,8 @@ function streamSimple(
 
     // Live process: model.streaming carries the assistant text, reasoning and
     // tool-call streams in real time; turn.completed delivers the final
-    // response as a fallback. state.updated (prompt_completed/prompt_failed)
-    // remains the terminal signal.
+    // response as a fallback. Authoritative turn.completed / turn.failed
+    // events are terminal; state.updated is used only as an error fallback.
     const onEvent = (msg: unknown) => {
       if (typeof msg !== "object" || msg === null) return;
       const m = msg as { method?: string; params?: unknown };
@@ -1390,24 +1420,28 @@ function streamSimple(
           reason?: string;
           patch?: { status?: string; lastError?: ZcodeTurnError };
         };
-        const reason = params.reason;
-        if (reason === "prompt_completed") settled = true;
-        if (reason === "prompt_failed") failed = true;
-        // Defensive fallback (unsubscribed/background turns): the session
-        // state patch carries status "error" + lastError when a turn fails.
-        if (params.patch?.status === "error") {
+        // prompt_completed is an unreliable compatibility snapshot in
+        // the app-server bundled with ZCode Desktop 0.16.5: it may arrive
+        // immediately *after* a new turn.started while the model is running. Completion must therefore use the
+        // authoritative session/event turn.completed / turn.failed frames.
+        // Keep only the error patch as a fallback for an unavailable event.
+        if (turnStarted && params.patch?.status === "error") {
           failed = true;
+          turnSettled = true;
           if (!turnError && params.patch.lastError?.message) {
             turnError = formatTurnError(params.patch.lastError);
           }
         }
-        if (reason === "prompt_completed" || reason === "prompt_failed") turnSettled = true;
         return;
       }
       if (m.method !== "session/event") return;
       const ev = m.params as ZcodeStreamEvent;
       if (!ev.type) return;
       const pl = ev.payload ?? {};
+      if (ev.type === "turn.started") {
+        turnStarted = true;
+        return;
+      }
       if (ev.type === "turn.completed") {
         if (typeof pl.response === "string" && pl.response) finalResponse = pl.response;
         settled = true;
@@ -1624,13 +1658,14 @@ function streamSimple(
     timer.unref?.();
 
     try {
-      // session/subscribe switches on live session/event notifications
-      // (desktop-continuous = push, not replay). Best-effort: without it the
-      // turn still completes and the harvest below yields the final text.
+      // session/subscribe switches on the authoritative live turn events.
+      // Do not continue when subscription fails: without turn.completed or
+      // turn.failed there is no race-free terminal signal in the app-server
+      // bundled with ZCode Desktop 0.16.5.
       await request("session/subscribe", {
         sessionId,
         deliveryKind: "desktop-continuous",
-      }).catch(() => {});
+      });
       // ZCode-native steer mode (guide): make the session inject inputs sent
       // while the turn is running at the next tool/message boundary.
       await setupGuideMode(sessionId);
@@ -1698,8 +1733,8 @@ function toPiModels(catalog: CatalogModel[]) {
         reasoning: false,
         input: ["text"],
         cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
-        contextWindow: 200000,
-        maxTokens: 8192,
+        contextWindow: m.contextWindow ?? 200000,
+        maxTokens: m.maxTokens ?? 8192,
       }))
     : FALLBACK_MODELS;
 }
