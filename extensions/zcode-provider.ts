@@ -945,6 +945,41 @@ function applyRuntimeModelMetadata(
   runtimeModelMetadata.set(model.id, { contextWindow, maxTokens, reasoningVariants });
 }
 
+interface ZcodeImportedHistory {
+  source: "claudeCode";
+  messages: Array<{ role: "user" | "assistant"; content: string }>;
+}
+
+// ZCode's importedHistory schema accepts conversational text only. On the
+// first ZCode turn in an existing Pi session, copy every earlier user/assistant
+// text message and leave the newest user message for the normal session/send.
+// Tool calls, tool results, images, and hidden reasoning are intentionally not
+// converted into misleading conversational messages.
+function importedPiHistory(context: Context): ZcodeImportedHistory | undefined {
+  let latestUserIndex = -1;
+  for (let i = context.messages.length - 1; i >= 0; i--) {
+    if (context.messages[i]?.role === "user") {
+      latestUserIndex = i;
+      break;
+    }
+  }
+  if (latestUserIndex <= 0) return;
+
+  const messages: ZcodeImportedHistory["messages"] = [];
+  for (const message of context.messages.slice(0, latestUserIndex)) {
+    if (message.role !== "user" && message.role !== "assistant") continue;
+    const content =
+      typeof message.content === "string"
+        ? message.content
+        : message.content
+            .filter((part) => part.type === "text")
+            .map((part) => part.text)
+            .join("");
+    if (content.trim()) messages.push({ role: message.role, content });
+  }
+  return messages.length > 0 ? { source: "claudeCode", messages } : undefined;
+}
+
 function applyContextSnapshotUsage(output: AssistantMessage, usage?: ZcodeContextUsage): void {
   const used = usage?.used;
   if (typeof used !== "number" || used < 0) return;
@@ -1925,8 +1960,13 @@ function streamSimple(
           }
         }
         if (!sessionId) {
+          // Modern app-server can import an existing Pi conversation when this
+          // Pi session has never used ZCode. This is a one-time bootstrap:
+          // rememberSession below makes every later turn/restart use resume.
+          const importedHistory = MODERN_PROTOCOL ? importedPiHistory(context) : undefined;
           const created = await request<{ session: { sessionId: string } }>("session/create", {
             workspace: { workspacePath: process.cwd(), workspaceKey: process.cwd() },
+            ...(importedHistory ? { importedHistory } : {}),
           });
           sessionId = created.session.sessionId;
           lastModelId = null;

@@ -6,6 +6,7 @@
 // reason prompt_completed can arrive after turn.started but before the new
 // model output and turn.completed event. Keep this fixture version-scoped and
 // revalidate it against the real app-server when ZCode's protocol changes.
+import { writeFileSync } from "node:fs";
 import { createInterface } from "node:readline";
 
 const input = createInterface({ input: process.stdin });
@@ -24,6 +25,9 @@ input.on("line", (line) => {
   const { id, method } = request;
 
   if (method === "session/create") {
+    if (process.env.FAKE_ZCODE_CREATE_MARKER) {
+      writeFileSync(process.env.FAKE_ZCODE_CREATE_MARKER, JSON.stringify(request.params));
+    }
     send({ id, result: { session: { sessionId: "fixture-session" } } });
     return;
   }
