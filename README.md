@@ -114,7 +114,8 @@ the raw protocol lines to `/tmp/zcode-probe.jsonl`.
 `zcodex app-server` speaks a private NDJSON protocol over stdio (not standard
 JSON-RPC). The bridge implements the subset:
 
-`session/create` → answer `session/requestRuntimePreferences` → `session/resume`
+`session/create` (with one-time `importedHistory` when needed) → answer
+`session/requestRuntimePreferences` → `session/resume`
 (no-op while resident, rehydrates after idle eviction) → `session/subscribe` →
 `session/send` → stream `session/event` notifications: `model.streaming`
 (text/reasoning/tool-input deltas), `tool.updated`, `turn.completed` and
@@ -137,6 +138,16 @@ instead of `session/create`, so the ZCode agent keeps its full session history
 (session memory, accumulated context, tool state). A fresh pi session in the
 same project, or a restore from a different working directory, still gets a
 new ZCode session as before.
+
+**Switching an existing Pi conversation to ZCode.** If the Pi session has no
+remembered ZCode session but already contains messages from another provider,
+the modern bridge passes all earlier user/assistant text to
+`session/create.importedHistory` once. The newest user message is excluded from
+the import and sent normally through `session/send`. The resulting ZCode
+session id is then remembered, so later turns and restarts use `session/resume`
+and never import the transcript again. The app-server import schema is
+text-only: tool calls, tool results, images, and hidden reasoning are not
+converted into conversational messages.
 
 ## Updates while a turn is running
 

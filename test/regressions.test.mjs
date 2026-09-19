@@ -36,6 +36,13 @@ test("ZCode owns compaction while Pi only reports completed auto-compactions", (
   assert.doesNotMatch(source, /request[^\n]*"session\/compact"/);
 });
 
+test("existing Pi text history is imported only when creating a ZCode session", () => {
+  assert.match(source, /const importedHistory = MODERN_PROTOCOL \? importedPiHistory\(context\)/);
+  assert.match(source, /importedHistory \? \{ importedHistory \} : \{\}/);
+  assert.match(source, /rememberSession\(sessionId, process\.cwd\(\)\)/);
+  assert.doesNotMatch(source, /session\/resume[^\n]*importedHistory/);
+});
+
 test("context usage comes from the final app-server snapshot", () => {
   assert.match(source, /applyContextSnapshotUsage\(output, snapshot\.runtime\?\.contextUsage\)/);
 });
